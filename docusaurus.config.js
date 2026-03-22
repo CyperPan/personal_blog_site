@@ -68,43 +68,14 @@ const config = {
           src: 'img/logo.svg',
         },
         items: [
-          {
-            type: 'docSidebar',
-            sidebarId: 'tutorialSidebar',
-            position: 'left',
-            label: '知识库',
-          },
-          {
-            to: '/docs/category/llm推理',
-            label: '推理',
-            position: 'left',
-          },
-          {
-            to: '/docs/category/llm训练',
-            label: '训练',
-            position: 'left',
-          },
-          {
-            to: '/docs/category/数学推导',
-            label: '数学推导',
-            position: 'left',
-          },
-          {
-            to: '/docs/category/编程题',
-            label: '编程题',
-            position: 'left',
-          },
-          {
-            to: '/docs/category/面经',
-            label: '面经',
-            position: 'left',
-          },
+          {to: '/docs/category/llm推理', label: '推理', position: 'left'},
+          {to: '/docs/category/llm训练', label: '训练', position: 'left'},
+          {to: '/docs/category/数学推导', label: '数学推导', position: 'left'},
+          {to: '/docs/category/论文解读', label: '论文解读', position: 'left'},
+          {to: '/docs/category/编程题', label: '编程题', position: 'left'},
+          {to: '/docs/category/面经', label: '面经', position: 'left'},
           {to: '/blog', label: '博客', position: 'left'},
-          {
-            href: 'https://github.com/CyperPan',
-            label: 'GitHub',
-            position: 'right',
-          },
+          {href: 'https://github.com/CyperPan', label: 'GitHub', position: 'right'},
         ],
       },
       footer: {
@@ -113,15 +84,16 @@ const config = {
           {
             title: '知识库',
             items: [
-              {label: 'LLM推理', to: '/docs/category/llm推理'},
-              {label: 'LLM训练', to: '/docs/category/llm训练'},
+              {label: '推理', to: '/docs/category/llm推理'},
+              {label: '训练', to: '/docs/category/llm训练'},
               {label: '数学推导', to: '/docs/category/数学推导'},
-              {label: '编程题', to: '/docs/category/编程题'},
+              {label: '论文解读', to: '/docs/category/论文解读'},
             ],
           },
           {
             title: '更多',
             items: [
+              {label: '编程题', to: '/docs/category/编程题'},
               {label: '面经', to: '/docs/category/面经'},
               {label: '博客', to: '/blog'},
               {label: 'GitHub', href: 'https://github.com/CyperPan'},

@@ -1,43 +1,32 @@
 // @ts-check
-// `@type` JSDoc annotations allow editor autocompletion and type checking
-// (when paired with `@ts-check`).
-// There are various equivalent ways to declare your Docusaurus config.
-// See: https://docusaurus.io/docs/api/docusaurus-config
-
 import {themes as prismThemes} from 'prism-react-renderer';
-
-// This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: 'Zhiyuan Pan',
-  tagline: 'Zhiyuan Pan\'s Blog',
+  tagline: 'LLM & AI Infra 知识库',
   favicon: 'img/favicon.ico',
 
-  // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
   future: {
-    v4: true, // Improve compatibility with the upcoming Docusaurus v4
+    v4: true,
   },
 
-  // Set the production url of your site here
   url: 'https://your-docusaurus-site.example.com',
-  // Set the /<baseUrl>/ pathname under which your site is served
-  // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: '/',
 
-  // GitHub pages deployment config.
-  // If you aren't using GitHub pages, you don't need these.
-  organizationName: 'facebook', // Usually your GitHub org/user name.
-  projectName: 'docusaurus', // Usually your repo name.
+  organizationName: 'CyperPan',
+  projectName: 'personal_blog_site',
 
-  onBrokenLinks: 'throw',
+  onBrokenLinks: 'warn',
+  onBrokenMarkdownLinks: 'warn',
 
-  // Even if you don't use internationalization, you can use this field to set
-  // useful metadata like html lang. For example, if your site is Chinese, you
-  // may want to replace "en" with "zh-Hans".
+  markdown: {
+    format: 'md',
+  },
+
   i18n: {
-    defaultLocale: 'en',
-    locales: ['en'],
+    defaultLocale: 'zh-Hans',
+    locales: ['zh-Hans'],
   },
 
   presets: [
@@ -45,19 +34,15 @@ const config = {
       'classic',
       /** @type {import('@docusaurus/preset-classic').Options} */
       ({
-        docs: false, // 禁用文档功能
+        docs: {
+          sidebarPath: './sidebars.js',
+        },
         blog: {
           showReadingTime: true,
-          routeBasePath: '/', // 将博客设为首页
           feedOptions: {
             type: ['rss', 'atom'],
             xslt: true,
           },
-          // Please change this to your repo.
-          // Remove this to remove the "edit this page" links.
-          editUrl:
-            'https://github.com/facebook/docusaurus/tree/main/packages/create-docusaurus/templates/shared/',
-          // Useful options to enforce blogging best practices
           onInlineTags: 'warn',
           onInlineAuthors: 'warn',
           onUntruncatedBlogPosts: 'warn',
@@ -72,7 +57,6 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
-      // Replace with your project's social card
       image: 'img/docusaurus-social-card.jpg',
       colorMode: {
         respectPrefersColorScheme: true,
@@ -80,12 +64,44 @@ const config = {
       navbar: {
         title: 'Zhiyuan Pan',
         logo: {
-          alt: 'My Site Logo',
+          alt: 'Logo',
           src: 'img/logo.svg',
         },
         items: [
           {
-            href: 'https://github.com/facebook/docusaurus',
+            type: 'docSidebar',
+            sidebarId: 'tutorialSidebar',
+            position: 'left',
+            label: '知识库',
+          },
+          {
+            to: '/docs/category/llm推理',
+            label: '推理',
+            position: 'left',
+          },
+          {
+            to: '/docs/category/llm训练',
+            label: '训练',
+            position: 'left',
+          },
+          {
+            to: '/docs/category/数学推导',
+            label: '数学推导',
+            position: 'left',
+          },
+          {
+            to: '/docs/category/编程题',
+            label: '编程题',
+            position: 'left',
+          },
+          {
+            to: '/docs/category/面经',
+            label: '面经',
+            position: 'left',
+          },
+          {to: '/blog', label: '博客', position: 'left'},
+          {
+            href: 'https://github.com/CyperPan',
             label: 'GitHub',
             position: 'right',
           },
@@ -95,37 +111,29 @@ const config = {
         style: 'dark',
         links: [
           {
-            title: 'Community',
+            title: '知识库',
             items: [
-              {
-                label: 'Stack Overflow',
-                href: 'https://stackoverflow.com/questions/tagged/docusaurus',
-              },
-              {
-                label: 'Discord',
-                href: 'https://discordapp.com/invite/docusaurus',
-              },
-              {
-                label: 'X',
-                href: 'https://x.com/docusaurus',
-              },
+              {label: 'LLM推理', to: '/docs/category/llm推理'},
+              {label: 'LLM训练', to: '/docs/category/llm训练'},
+              {label: '数学推导', to: '/docs/category/数学推导'},
+              {label: '编程题', to: '/docs/category/编程题'},
             ],
           },
           {
-            title: 'More',
+            title: '更多',
             items: [
-              {
-                label: 'GitHub',
-                href: 'https://github.com/facebook/docusaurus',
-              },
+              {label: '面经', to: '/docs/category/面经'},
+              {label: '博客', to: '/blog'},
+              {label: 'GitHub', href: 'https://github.com/CyperPan'},
             ],
           },
         ],
-        copyright: `Copyright © ${new Date().getFullYear()} My Project, Inc. Built with Docusaurus.`,
+        copyright: `Copyright © ${new Date().getFullYear()} Zhiyuan Pan. Built with Docusaurus.`,
       },
       prism: {
         theme: prismThemes.github,
         darkTheme: prismThemes.dracula,
+        additionalLanguages: ['python', 'bash', 'cpp', 'java'],
       },
     }),
 };

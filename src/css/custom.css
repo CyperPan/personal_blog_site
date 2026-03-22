@@ -4,27 +4,46 @@
  * work well for content-centric websites.
  */
 
-/* You can override the default Infima variables here. */
 :root {
-  --ifm-color-primary: #2e8555;
-  --ifm-color-primary-dark: #29784c;
-  --ifm-color-primary-darker: #277148;
-  --ifm-color-primary-darkest: #205d3b;
-  --ifm-color-primary-light: #33925d;
-  --ifm-color-primary-lighter: #359962;
-  --ifm-color-primary-lightest: #3cad6e;
+  --ifm-color-primary: #5b6abf;
+  --ifm-color-primary-dark: #4a5ab5;
+  --ifm-color-primary-darker: #4454ae;
+  --ifm-color-primary-darkest: #38468f;
+  --ifm-color-primary-light: #6c7ac9;
+  --ifm-color-primary-lighter: #7380cd;
+  --ifm-color-primary-lightest: #9199db;
   --ifm-code-font-size: 95%;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --ifm-font-family-base: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
 }
 
-/* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary: #25c2a0;
-  --ifm-color-primary-dark: #21af90;
-  --ifm-color-primary-darker: #1fa588;
-  --ifm-color-primary-darkest: #1a8870;
-  --ifm-color-primary-light: #29d5b0;
-  --ifm-color-primary-lighter: #32d8b4;
-  --ifm-color-primary-lightest: #4fddbf;
+  --ifm-color-primary: #8b9cf7;
+  --ifm-color-primary-dark: #6e83f4;
+  --ifm-color-primary-darker: #5f76f3;
+  --ifm-color-primary-darkest: #334eee;
+  --ifm-color-primary-light: #a8b5fa;
+  --ifm-color-primary-lighter: #b7c2fb;
+  --ifm-color-primary-lightest: #e1e6fd;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* Sidebar styling */
+.theme-doc-sidebar-container {
+  border-right: 1px solid var(--ifm-color-emphasis-200);
+}
+
+.menu__link {
+  font-size: 0.95rem;
+}
+
+/* Article content */
+article {
+  max-width: 900px;
+}
+
+/* Table styling for docs */
+table {
+  display: table;
+  width: 100%;
 }

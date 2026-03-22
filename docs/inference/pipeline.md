@@ -1,0 +1,1250 @@
+---
+sidebar_position: 1
+title: "LLM推理面试题(按Pipeline)"
+---
+
+# 按 LLM 推理链路整理的面试问题与答案
+
+> 文档定位：把 LLM 推理面试题按“真实推理链路”组织，而不是按零散主题堆放。这样更适合建立整体系统观，也更方便在面试中按阶段展开。
+
+---
+
+
+
+在线 LLM 推理链路可以整理成：
+
+1. **请求进入与 Tokenization**
+2. **调度与 Batching**
+3. **Prefill**
+4. **Attention 与 KV Cache**
+5. **FFN / MoE**
+6. **Decode**
+7. **Speculative Decoding（可选）**
+8. **Sampling 与 Output**
+9. **跨阶段优化与指标**
+
+---
+
+## 目录
+
+- [模块 1：请求进入与 Tokenization](#模块-1请求进入与-tokenization)
+- [模块 2：调度与 Batching](#模块-2调度与-batching)
+- [模块 3：Prefill](#模块-3prefill)
+- [模块 4：Attention 与 KV Cache](#模块-4attention-与-kv-cache)
+- [模块 5：FFN / MoE](#模块-5ffn--moe)
+- [模块 6：Decode](#模块-6decode)
+- [模块 7：Speculative Decoding（可选）](#模块-7speculative-decoding可选)
+- [模块 8：Sampling 与 Output](#模块-8sampling-与-output)
+- [模块 9：跨阶段优化与指标](#模块-9跨阶段优化与指标)
+- [模块 10：推理核心技术补充面试题](#模块-10推理核心技术补充面试题)
+- [模块 11：模型架构面试题](#模块-11模型架构面试题)
+- [模块 12：推理系统深度面试题](#模块-12推理系统深度面试题)
+
+---
+
+## 模块 1：请求进入与 Tokenization
+
+### 这一模块在干什么
+
+用户请求先经过 API 接入、排队、文本预处理和 tokenization，之后才会进入真正的模型计算。这个阶段常被忽略，但在短请求和高 QPS 场景下，它会直接影响 TTFT。
+
+### 高频问题 1：为什么推理岗位也会问 tokenizer，而不只是问模型和 kernel？
+
+**答：**
+
+因为 tokenizer 虽然在模型之前，但它会直接影响请求的首 token 延迟。短请求场景下，tokenization 在 TTFT 里的占比并不低；高并发场景下，它还可能成为 CPU 侧瓶颈。所以面试官问 tokenizer，本质上是在看你是不是把推理链路理解成一个完整系统，而不是只盯着 GPU kernel。
+
+### 高频问题 2：为什么有些系统会把 tokenization 放在 CPU 侧并做并行化？
+
+**答：**
+
+因为 tokenization 逻辑复杂、分支多，不适合放到 GPU 上做；而且 CPU 可以多线程并行处理多个请求，并和 GPU 推理做 overlap。这样设计的目标不是让 tokenizer 更“高级”，而是避免 GPU 等待输入准备，降低端到端 TTFT。
+
+### 高频问题 3：一次完整的 LLM 在线推理链路怎么讲？
+
+**答：**
+
+可以按下面这个顺序回答：
+
+`请求进入 -> tokenization -> scheduler 排队 -> prefill 生成 KV cache -> decode 循环执行 attention/FFN -> sampling -> 流式输出或结束`
+
+这样回答的好处是，你既交代了模型内部计算，也交代了 serving 侧的调度点。面试里最好顺手补一句：`prefill 更偏 compute-bound，decode 更偏 memory-bound`，这样层次会更完整。
+
+---
+
+## 模块 2：调度与 Batching
+
+### 这一模块在干什么
+
+调度器负责决定请求什么时候进入 GPU、如何组成 batch、长短请求如何共存、系统在延迟和吞吐之间如何取舍。这个模块决定了线上服务是不是“稳”。
+
+### 高频问题 1：静态 batching 和 continuous batching 的区别？
+
+**答：**
+
+静态 batching 是先攒一批请求，再固定 batch 跑完；continuous batching 则允许请求在运行过程中动态加入和退出。LLM 服务里请求长短差异很大，所以静态 batch 很容易被长请求拖住，而 continuous batching 可以更充分地利用 GPU，提高吞吐和资源利用率。
+
+### 高频问题 2：Continuous batching 为什么适合 LLM serving？
+
+**答：**
+
+因为在线 LLM 服务里，请求的 prompt 长度和输出长度都高度不均匀。continuous batching 的价值在于让 GPU 的每个 step 都尽量有活干，而不是因为某几个长尾请求导致整个 batch 空转。它最直接改善的是 throughput，但不保证 TTFT 一定更优，因为调度公平性和排队策略也很关键。
+
+### 高频问题 3：什么是 in-flight batching？
+
+**答：**
+
+in-flight batching 本质上就是 continuous batching 的另一种说法，强调“一个正在运行的 batch 可以持续插入新请求”。如果面试官提这个词，不要被术语绕住，直接回答：**它就是 token 级动态调度 batch 的实现方式。**
+
+### 高频问题 4：为什么 admission control 在多租户推理系统里是必需的？
+
+**答：**
+
+因为在线服务不是只看“能不能跑”，还要看不同租户之间的资源隔离、优先级和过载保护。如果没有 admission control，某个大流量租户可能会把队列打爆，导致高优先级请求的 TTFT 和 P99 延迟一起恶化。
+
+---
+
+## 模块 3：Prefill
+
+### 这一模块在干什么
+
+Prefill 指的是把整段 prompt 一次性送入模型，完成所有 layer 的前向计算，并生成初始 KV Cache。它通常是长 prompt 场景下的主要计算来源。
+
+### 高频问题 1：什么是 prefill，什么是 decode？
+
+**答：**
+
+Prefill 是把整段 prompt 一次性过模型，算出各层 KV Cache；decode 是后续逐 token 生成，每一步只输入最新 token，但会读取历史 KV。面试里这题的关键不是只会下定义，而是要补一句：**prefill 更偏 compute-bound，decode 更偏 memory-bound，所以优化手段不一样。**
+
+### 高频问题 2：为什么 prefill 更偏 compute-bound？
+
+**答：**
+
+因为 prefill 会同时处理整段输入序列，矩阵规模更大，算子的 arithmetic intensity 更高，更容易把 Tensor Core 和算力资源吃满。相比之下，decode 每次只处理一个新 token，计算量不大，但要频繁搬运权重和 KV，所以更受带宽限制。
+
+### 高频问题 2.5：用 Roofline 模型怎么分析 prefill 和 decode？
+
+**答：**
+
+Roofline 模型横轴是算术强度（FLOPs/Byte），纵轴是实际吞吐（FLOPs/s）。拐点 = 峰值算力 / 峰值带宽。
+
+```
+性能 (FLOPs/s)
+    │        _______________  ← 峰值算力
+    │       /     ★ Prefill (compute-bound)
+    │      /
+    │     /
+    │    / ★ Decode batch=1 (memory-bound)
+    │   /
+    └──────────────────────── 算术强度 (FLOPs/Byte)
+```
+
+**Prefill：** 处理整段 prompt（长度 s），做大规模 GEMM。算术强度 ≈ O(s)，随 prompt 长度线性增长，通常落在 **compute-bound 区域**。
+
+**Decode：** 每步只处理 1 个 token（batch=1 时是 GEMV）。算术强度 ≈ O(1)，非常低，落在 **memory-bound 区域**。
+
+**H100 SXM 数值示例：**
+- BF16 峰值算力 ~990 TFLOPS，HBM 带宽 ~3.35 TB/s → 拐点 ≈ **295 FLOPs/Byte**
+- Decode (batch=1, 7B)：算术强度 ≈ 1~2 → 极度 memory-bound
+- Decode (batch=64)：算术强度 ≈ 64~128 → 接近拐点
+- Prefill (seq_len=2048)：算术强度 > 300 → compute-bound
+
+**面试关键点：** 增大 batch size 可以把 decode 从 memory-bound 区域往 compute-bound 方向推，这也是 continuous batching 的价值所在。
+
+### 高频问题 3：什么是 chunked prefill？
+
+**答：**
+
+chunked prefill 是把很长的 prompt 切成多个块分步执行，而不是让单个请求一次性独占 GPU 很久。它的核心作用不是让单个请求绝对更快，而是改善混合流量下的尾延迟和公平性，让 decode 请求不会一直被超长 prefill 卡住。
+
+### 高频问题 4：Prefix caching 是什么？它主要优化什么？
+
+**答：**
+
+Prefix caching 是多个请求拥有相同前缀时，直接复用已有前缀 KV，而不是每次都重新做 prefill。它最直接改善的是 TTFT，因为节省了重复 prompt 的前向计算；在系统提示词固定、RAG 模板固定、多轮对话前缀高度重复的业务里收益很明显。
+
+---
+
+## 模块 4：Attention 与 KV Cache
+
+### 这一模块在干什么
+
+Attention 是 Transformer 的核心计算；KV Cache 则是把历史 token 的 K/V 保存下来，避免 decode 时重复计算。这个模块是理解长上下文推理和 decode 瓶颈的关键。
+
+### 高频问题 1：为什么 KV Cache 是推理优化核心？
+
+**答：**
+
+因为自回归生成每出一个新 token，都要依赖之前所有 token 的 K/V；如果不缓存，每一步都要重算整段上下文，计算量会爆炸。KV Cache 让计算省下来了，但也把显存容量和带宽压力推高了，所以 PagedAttention、GQA、prefix caching 这些优化本质上都在处理 KV 问题。
+
+### 高频问题 2：什么是 PagedAttention？它解决了什么问题？
+
+**答：**
+
+PagedAttention 的核心是把 KV Cache 按固定大小 block 管理，而不是给每个请求预留一整段连续显存。这样可以显著缓解显存碎片问题，更好支持变长请求和 continuous batching。它主要改善的是 KV 利用率、可服务并发和长上下文能力。
+
+### 高频问题 3：MHA、MQA、GQA 的区别是什么？为什么 GQA/MQA 对推理更有利？
+
+**答：**
+
+MHA 是每个 Q head 都有自己的 K/V head；MQA 是多个 Q head 共享一组 K/V；GQA 则是在两者之间做分组共享。GQA/MQA 对推理更友好，是因为 decode 阶段的热点通常是读 KV，而不是做大矩阵计算；减少 K/V head 数量，就等于直接减少 KV Cache 体积和访存压力。
+
+### 高频问题 4：FlashAttention 和 PagedAttention 的区别是什么？
+
+**答：**
+
+FlashAttention 优化的是 **Attention 计算过程中的 HBM 读写**，本质是 IO-aware kernel；PagedAttention 优化的是 **KV Cache 的内存分配与管理**，本质是更高效的显存布局。一个偏计算 kernel，一个偏内存管理，两者不是替代关系，而是可以叠加使用。
+
+### 高频问题 5：如果现场让你手撕 `MHA / linear attention / MLA`，面试官真正想看什么？
+
+**答：**
+
+不是单纯看你能不能把代码写出来，而是看你有没有“结构 + 复杂度 + 访存”三层意识。`MHA` 要写清 `Q / K / V` 投影、mask 和多头 reshape；`linear attention` 要体现把二次复杂度改写成可累计形式；`MLA` 要体现“先压缩再参与注意力”这件事。面试里如果只会抄公式，不会解释它们分别在省什么，分数通常不会高。
+
+### 高频问题 6：`MHA`、`GQA/MQA`、`MLA` 在 decode 阶段最大的差别是什么？
+
+**答：**
+
+最大的差别通常不在“这一步多了多少 FLOPs”，而在 `KV Cache` 体积和读取带宽。`MHA` 需要为每个 head 保留完整 K/V；`GQA/MQA` 通过共享 K/V 头减少缓存；`MLA` 进一步把缓存压到更紧凑的 latent 表示上，所以长上下文时更容易降低显存占用和 decode 访存压力。面试里最好直接点明：**decode 阶段最怕的是搬不动 KV，不是算不动 attention。**
+
+### 高频问题 7：MLA（Multi-head Latent Attention）的原理是什么？
+
+**答：**
+
+MLA 是 DeepSeek-V2 提出的 KV Cache 压缩方法。核心思想是将 KV 压缩到低维 latent 空间，只缓存 latent 向量。
+
+```
+传统 MHA/GQA: KV Cache = [K_1,...,K_H, V_1,...,V_H]   (大)
+MLA:         hidden → 下投影 → latent vector c (维度 d_c << H×d_head)
+             KV Cache = [c]   (极小)
+             推理时: c → 上投影恢复 K,V → 做 attention
+```
+
+通过数学变换，可以将上投影 fuse 进 Q 的投影中，避免显式恢复 K/V。DeepSeek-V2 的 KV Cache 压缩到 GQA 的约 **1/5~1/10**。
+
+### 高频问题 7.5：MHA → MQA → GQA → MLA 的 KV Cache 压缩对比
+
+**答：**
+
+| 方法 | KV head 数 | KV Cache 大小（相对 MHA） | 表达能力 | 代表模型 |
+|------|-----------|-------------------------|---------|---------|
+| **MHA** | H | 1x | 最强 | GPT-3, BERT |
+| **MQA** | 1 | 1/H | 最弱 | PaLM, StarCoder |
+| **GQA** | G (1<G<H) | G/H | 较强 | LLaMA 2/3, Qwen2 |
+| **MLA** | latent | ~1/5~1/10 x GQA | 强 | DeepSeek-V2/V3 |
+
+面试里最好直接点明：**所有 KV 压缩手段的核心目标都是减少 decode 时的 KV 读取量，缓解 memory-bound 瓶颈。**
+
+### 高频问题 8：为什么很多 attention 题最后都会追问”访存怎么估”？
+
+**答：**
+
+因为线上推理性能往往不是输在公式推不出来，而是输在你不知道系统到底在读什么。attention 的计算只是表面，真正决定 decode TPOT 的，往往是历史 `K/V`、权重和中间张量的读取量。所以面试官追问访存，本质上是在确认你能不能把算法题落到 GPU 和服务系统里。
+
+---
+
+## 模块 5：FFN / MoE
+
+### 这一模块在干什么
+
+在标准 dense Transformer 中，Attention 后面会接 FFN；在 MoE 模型里，这一部分会变成“router + expert”的稀疏计算路径。所以这里要先明确：**MoE 是 FFN 的一种变体，不是 attention 后面的独立大阶段。**
+
+### 高频问题 1：MoE 在推理链路中的位置是什么？
+
+**答：**
+
+MoE 出现在 Transformer layer 内部，通常替代原本的 dense FFN。也就是说，模型在每一层里先做 attention，再根据 router 选择少量 expert 做后续前向，而不是跑完所有 attention 之后，再统一进入一个独立的“MoE 阶段”。
+
+### 高频问题 2：为什么 MoE 说是“算力省了，但通信炸了”？
+
+**答：**
+
+因为 MoE 每个 token 只激活少量 expert，从纯计算角度看比 dense FFN 更省；但这些 expert 往往分布在不同 GPU 上，token 需要根据 router 结果在多卡之间做 AllToAll 分发。这样就把问题从“算不算得动”变成了“网络和调度扛不扛得住”。
+
+### 高频问题 3：为什么 MoE 场景更容易出通信问题？
+
+**答：**
+
+因为 token 到 expert 的映射是动态的，负载不均和跨卡分发都比较严重。只要 AllToAll 频繁发生，网络就容易成为瓶颈。面试里如果被追问，可以继续答 expert placement、capacity factor、router 负载均衡和拓扑感知调度。
+
+### 高频问题 4：FFN 为什么常常是参数量大头？
+
+**答：**
+
+在标准 Transformer 里，FFN 往往包含两个大矩阵，参数量通常比 attention 投影更大。所以很多模型从“参数分布”角度看，FFN 才是大头；而从“长序列计算”角度看，attention 又经常是热点。面试里不要把“参数量最大”和“最慢”混为一谈。
+
+### 高频问题 5：如果现场让你手撕 `MoE`，标准回答应该包含哪些部分？
+
+**答：**
+
+最少要把 `router -> top-k -> dispatch -> expert forward -> weighted combine` 这条链路写完整，并说明 token 不是过所有 expert，而是只过被选中的少数 expert。如果面试官继续追问，下一层通常就是：负载怎么均衡、capacity factor 有什么用、为什么会引入 `AllToAll` 通信。也就是说，`MoE` 题写代码只是起点，真正要看的是你能不能把稀疏激活的系统代价讲出来。
+
+---
+
+## 模块 6：Decode
+
+### 这一模块在干什么
+
+Decode 是每生成一个 token 就重复执行一次的循环：读取最新输入 token、读历史 KV、做 attention/FFN、得到 logits，再进入 sampling。这个阶段是在线服务里最容易成为性能瓶颈的地方。
+
+### 高频问题 1：为什么 decode 往往更难优化？
+
+**答：**
+
+因为 decode 每一步只生成极少量 token，单次计算量不大，但要频繁读取大体积权重和 KV Cache，算力利用率不高，却很容易把显存带宽打满。所以 decode 的核心矛盾通常不是 FLOPs 不够，而是带宽、缓存和调度效率不够。
+
+### 高频问题 2：为什么说 decode 常常是 memory-bound？
+
+**答：**
+
+因为每一步 decode 都要重新读取大部分模型权重，并访问不断增长的 KV Cache，而真正新增的计算量却很小。用更直白的话说，就是“搬数据的成本大于算数据的成本”，所以优化 decode 时，量化、KV 压缩、访存模式和 batching 往往比单纯提高峰值算力更重要。
+
+### 高频问题 3：P/D 分离为什么会在 decode 阶段特别重要？
+
+**答：**
+
+因为 decode 对尾延迟非常敏感，而长 prompt 的 prefill 很容易打断它。P/D 分离本质上是把 compute-bound 的 prefill 和 memory-bound 的 decode 拆到不同资源池里，让 decode 的 TPOT 和 P99 更稳定。它不一定白送吞吐，但常常能换来更稳的线上体验。
+
+### 高频问题 4：decode 很慢但 GPU 利用率不高，优先怀疑什么？
+
+**答：**
+
+优先看四件事：
+
+1. batch 太小，调度没把 GPU 喂饱
+2. CPU 侧 tokenizer 或调度器拖住了 GPU
+3. 实际瓶颈在 HBM 带宽，而不是算力
+4. 多卡通信或 NCCL 等待拉长了 step
+
+如果面试官要你继续展开，最好回答“先看 timeline，再看带宽和 SM 利用率，再看 queue depth 和 KV 利用率”。
+
+---
+
+## 模块 7：Speculative Decoding（可选）
+
+### 这一模块在干什么
+
+Speculative Decoding 不是所有服务都会开启，但它是 decode 阶段最常见的高级加速技巧之一。它的核心思想是先让小模型或草稿机制生成多个 token，再让大模型批量验证。
+
+### 高频问题 1：什么是 speculative decoding？
+
+**答：**
+
+Speculative decoding 是先用一个更快的 draft 模型猜一串 token，再让目标大模型一次性验证。如果前面若干 token 被接受，就等于减少了大模型逐 token 解码的次数。它的本质是把串行 decode 变成“猜测 + 批量验证”的组合。
+
+### 高频问题 2：它主要优化什么指标？
+
+**答：**
+
+它更直接改善的是 decode 阶段的 TPOT / ITL，因为目标是减少大模型逐 token 走完整路径的次数。在某些负载下，它也可能提升整体吞吐，但它不是天然提升 TTFT 的工具。
+
+### 高频问题 3：为什么 speculative decoding 不一定总能加速？
+
+**答：**
+
+因为收益高度依赖 acceptance rate。如果 draft 猜得不准，大模型还是要重算，大量验证工作就白做了；如果系统已经处在强 memory-bound 或高负载状态，引入 draft 模型还可能额外抢占资源，导致整体吞吐下降。
+
+### 高频问题 4：什么情况下 speculative decoding 更容易有效？
+
+**答：**
+
+通常是：
+
+- 输出模式比较稳定，例如代码补全、模板化文本
+- acceptance rate 较高
+- 目标模型还有一定富余计算资源
+
+面试里不要说“它只适合低 batch”，更准确的说法是：**它更适合有空余计算预算、且猜中率较高的场景。**
+
+### 高频问题 5：Lookahead Decoding 是什么？
+
+**答：**
+
+Lookahead 不需要额外的 draft 模型，利用 Jacobi 迭代的思想在单个大模型上并行生成多个 token。维护一个 n-token 窗口，每个位置同时猜测，每步用上一步的猜测值做 parallel forward，位置猜测收敛即接受。优点是不需要 draft 模型，缺点是加速比通常低于 draft model 方案（约 1.5-2x）。
+
+### 高频问题 6：N-gram Speculative Decoding 怎么做？
+
+**答：**
+
+用 n-gram 统计作为 draft 策略：在生成过程中维护已生成 token 的 n-gram 表，当前 context 末尾匹配到 n-gram 时，直接用后续 token 作为 draft，再由大模型验证。极其轻量（零额外参数），但只在重复性内容（代码、模版文本）中有效。
+
+### 高频问题 7：Medusa 是什么？
+
+**答：**
+
+Medusa 在大模型的 LM head 旁边加多个额外的"Medusa head"，每个 head 预测未来第 k 个 token。
+
+```
+             ┌→ Medusa Head 1 → 预测 t+1
+hidden state ├→ Medusa Head 2 → 预测 t+2
+             ├→ Medusa Head 3 → 预测 t+3
+             └→ Original Head → 预测 t+1（验证用）
+```
+
+用 **tree attention** 组合多种候选序列，大模型一次 forward 验证整棵候选树，接受最长正确路径。不需要独立 draft 模型，只增加少量参数（~几百 MB），但需要额外训练 Medusa head。典型加速比 2-2.5x。
+
+### 高频问题 8：EAGLE 是什么？和 Medusa 有什么区别？
+
+**答：**
+
+EAGLE（Extrapolation Algorithm for Greater Language-model Efficiency）在**特征级别**做 draft：用一个轻量自回归网络（如单层 Transformer）预测大模型下一步的 hidden state，然后通过 LM head 得到 token。
+
+**与 Medusa 的核心区别：**
+- Medusa 每个 head **独立**预测，不考虑已预测 token 之间的依赖
+- EAGLE 在 feature space **自回归**，能捕捉 token 间依赖 → acceptance rate 更高
+
+典型加速比 **2.5-3.5x**（高于 Medusa 的 2-2.5x）。
+
+### 高频问题 9：投机解码方案对比
+
+| 方法 | 需要额外模型 | 额外参数量 | 典型加速比 | 适用场景 |
+|------|------------|-----------|-----------|---------|
+| **Draft Model** | 是（小模型） | 完整小模型 | 2-3x | 通用 |
+| **Lookahead** | 否 | 0 | 1.5-2x | 不想维护额外模型 |
+| **N-gram** | 否 | 0 | 1.2-2x | 重复性内容 |
+| **Medusa** | 否（加 head） | ~几百 MB | 2-2.5x | 不想维护独立 draft |
+| **EAGLE** | 否（加小网络） | ~几百 MB | 2.5-3.5x | 追求高 acceptance rate |
+
+---
+
+## 模块 8：Sampling 与 Output
+
+### 这一模块在干什么
+
+模型在每一步 decode 后会输出 logits，接下来要做采样、约束解码、流式返回，直到遇到 EOS 或 stop condition。这个模块直接决定用户看到的内容质量、结构化程度和交互体验。
+
+### 高频问题 1：Sampling 在推理链路中的位置是什么？
+
+**答：**
+
+Sampling 发生在每一步 decode 之后。模型先输出 logits，再经过 temperature、top-k、top-p、repetition penalty 等策略选择下一个 token，接着把这个 token 回填到下一轮 decode。也就是说，sampling 不是模型外面的装饰，而是自回归生成闭环的一部分。
+
+### 高频问题 2：temperature、top-k、top-p 各自怎么理解？
+
+**答：**
+
+- **temperature**：调节分布平滑程度，越低越保守，越高越随机
+- **top-k**：只在概率最高的前 k 个 token 里采样
+- **top-p**：只在累计概率达到阈值 p 的 token 集合里采样
+
+面试里更好的回答方式不是逐个背定义，而是补一句：**它们本质上都在控制输出的随机性和稳定性，只是裁剪分布的方式不同。**
+
+### 高频问题 3：为什么 JSON mode / grammar constrained decoding 常常变慢？
+
+**答：**
+
+因为它要求系统在每一步都根据语法规则重新计算“哪些 token 合法”，这会增加额外的 mask 计算和约束逻辑，某些情况下还会降低缓存命中率。换句话说，它是用更强的输出可控性，换更高的每步解码开销。
+
+### 高频问题 4：流式输出为什么重要？
+
+**答：**
+
+因为用户并不只在乎总时延，还在乎“模型什么时候开始说话”。流式输出能把 TTFT 之后的结果尽早展示出来，显著改善交互体验。很多时候，业务侧感知的“快”，并不来自绝对总耗时最短，而是来自首 token 快、后续输出连续。
+
+---
+
+## 模块 9：跨阶段优化与指标
+
+### 为什么要单独有这个模块
+
+量化、FlashAttention、CUDA Graph、benchmark、profiling 这些内容并不只属于某一个阶段，而是跨阶段影响整个推理链路。所以更适合单独归类。
+
+### 高频问题 1：为什么量化能提升推理效率？
+
+**答：**
+
+因为 LLM 推理尤其是 decode 阶段，经常受显存容量和带宽限制。量化把权重和激活变小后，显存占用下降、HBM 读写流量下降，在有硬件支持的情况下算子吞吐也可能提升。所以量化最稳定的收益通常先体现在“省显存、提并发、降 TPOT”，而不是任何场景下都线性提速。
+
+### 高频问题 2：量化一定更快吗？
+
+**答：**
+
+不一定。它是否更快取决于目标硬件有没有对应低精度支持、kernel 是否成熟、以及 dequantization 开销是否把收益吃掉。所以面试里如果只说“INT4 一定比 BF16 快”，通常会被追问。
+
+### 高频问题 3：FlashAttention 解决了什么问题？
+
+**答：**
+
+FlashAttention 没改 attention 的数学形式，而是通过 IO-aware 的执行方式减少显存读写和中间张量搬运。它主要解决的是 attention 计算中的 HBM 瓶颈，尤其适合长序列和高注意力开销场景。
+
+### 高频问题 4：做推理 benchmark 最先要定义什么？
+
+**答：**
+
+首先要定义目标：到底是比最大吞吐、最低 TTFT、最低 ITL，还是某延迟约束下的 throughput；然后要固定 workload：prompt 长度、输出长度、并发数、采样参数、batch 策略。如果这两件事不先定好，benchmark 很容易变成“换了问题还在比答案”。
+
+### 高频问题 5：Profiling 时怎么区分 compute、memory、communication 瓶颈？
+
+**答：**
+
+可以按这个顺序判断：
+
+1. 看热点算子和 timeline
+2. 看 SM 利用率和 HBM 带宽利用率
+3. 看 NCCL / 等待对端数据的时间占比
+
+如果 SM 很忙但带宽没打满，通常更偏 compute-bound；如果带宽接近打满而算力利用一般，更偏 memory-bound；如果大量时间卡在 collectives 上，就是 communication-bound。
+
+### 高频问题 6：如果面试官要求你手算某种结构的参数量和单步 decode 访存量，应该怎么答？
+
+**答：**
+
+先分三层：`总参数量`、`单 token 激活参数量`、`单步 decode 读取量`。对 dense 模型，decode 时近似要读一遍主干权重，再读当前上下文对应的历史 `KV`；对 `MoE`，不是所有 expert 都会被激活，所以单 token 激活参数量通常远小于总参数量；对 `MLA / GQA`，关键不是参数少多少，而是 `KV` 侧缓存和带宽少多少。只要你先把这三件事分开，后面的公式就不容易乱。
+
+### 高频问题 7：CUDA Graph 在推理中的作用是什么？
+
+**答：**
+
+CUDA Graph 把一段相对固定的 GPU 执行图（一系列 kernel launch 和它们之间的依赖）capture 下来，之后每次 replay 就不需要 CPU 反复发射和调度。在 decode 阶段，每步的计算图几乎一样（shape 固定），所以 CUDA Graph 能显著减少 CPU 侧 kernel launch overhead 和调度抖动。它最适合 **decode 阶段**，因为 decode 每步计算量小、kernel 多但 shape 不变；对 prefill 来说，由于 prompt 长度动态变化，CUDA Graph 的收益有限。
+
+### 高频问题 7.5：SGEMM 中的 Double Buffer 和底层 GPU 调度是怎么回事？
+
+**答：**
+
+LLM 推理中 prefill 和 decode 的核心计算都是 GEMM（General Matrix Multiply）。理解 SGEMM（单精度 GEMM）的 double buffer 机制，本质上是理解 GPU 如何在 kernel 内部做**访存与计算的重叠（overlap）**。
+
+**背景：为什么需要 double buffer？**
+
+GPU 上一个 GEMM kernel 的典型执行流程是：
+1. 从 Global Memory（HBM）加载一块数据到 Shared Memory（SMEM）
+2. 从 SMEM 加载到寄存器
+3. 在寄存器里用 FMA / Tensor Core 做乘加计算
+
+如果每一步都串行执行，计算单元在等数据搬运时就会空转。Double buffer 就是为了解决这个问题。
+
+**Double Buffer 的核心思路：**
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Shared Memory                      │
+│  ┌──────────────┐         ┌──────────────┐          │
+│  │   Buffer A   │         │   Buffer B   │          │
+│  └──────────────┘         └──────────────┘          │
+└─────────────────────────────────────────────────────┘
+
+时间线：
+Step 0:  Load tile_0 → Buffer A
+Step 1:  Compute(Buffer A)  +  Load tile_1 → Buffer B    ← overlap
+Step 2:  Compute(Buffer B)  +  Load tile_2 → Buffer A    ← overlap
+Step 3:  Compute(Buffer A)  +  Load tile_3 → Buffer B    ← overlap
+...
+```
+
+- 在 SMEM 中分配 **两份 buffer**（A 和 B）
+- 当计算单元在用 Buffer A 做矩阵乘时，同时用异步拷贝（`cp.async` / `ldg` + 流水线）把下一块 tile 从 HBM 加载到 Buffer B
+- 下一轮交换：计算 Buffer B，加载到 Buffer A
+- 这样**Global Memory 访存延迟被计算完全遮盖**，只要计算时间 ≥ 访存时间，流水线就不会 stall
+
+**底层 GPU 调度机制：**
+
+Double buffer 能生效依赖 GPU 硬件的几个关键机制：
+
+1. **Warp Scheduler**：每个 SM 上有多个 warp 同时驻留。当一个 warp 在等 memory 返回时，warp scheduler 切换到另一个 ready 的 warp 执行计算指令，实现**指令级并行（ILP）和线程级并行（TLP）** 的隐藏延迟
+2. **异步拷贝指令**：Ampere 架构引入 `cp.async`，允许 Global→Shared 的拷贝不经过寄存器、不阻塞计算管线，数据搬运和 FFMA/HMMA 指令可以真正并行
+3. **Barrier 同步**：每轮计算开始前需要一个 `__syncthreads()` 或 `cp.async.wait_group` 确保上一轮加载完成，但只要流水线深度够，这个等待时间可以被前面的计算吸收
+
+**与 CUTLASS / cuBLAS 的关系：**
+
+NVIDIA 的 CUTLASS 库在 GEMM kernel 中大量使用 double buffer（甚至 multi-stage buffer，如 3~5 级流水线）：
+
+- **Single buffer**：Load → Sync → Compute → Load → Sync → Compute（串行，SM 利用率低）
+- **Double buffer**：2 级流水线，计算和访存重叠
+- **Multi-stage（Ampere+）**：3~5 级 buffer + `cp.async`，进一步隐藏更深的 HBM 延迟
+
+在 Hopper 架构上，TMA（Tensor Memory Accelerator）进一步把 tile 搬运卸载给专用硬件，配合 wgmma 指令，GEMM 流水线可以做到接近理论峰值的利用率。
+
+**面试关键点：**
+
+- Double buffer 的本质是**用空间（多份 SMEM buffer）换时间（隐藏访存延迟）**
+- 它在 SGEMM/HGEMM 中都适用，不限于单精度
+- 面试追问"为什么 GPU 算 GEMM 比 CPU 快这么多"时，答案不只是"核多"，更重要的是 **warp 级别的延迟隐藏 + 异步数据搬运 + 分块计算的流水线设计**
+- 这个原理也解释了为什么 kernel 的 tile size 选择很重要：tile 太小，计算不够遮盖访存；tile 太大，SMEM 放不下或 occupancy 下降
+
+### 高频问题 8：KV Cache 量化是什么？为什么近年越来越受关注？
+
+**答：**
+
+KV Cache 量化是把缓存的 K/V 张量从 FP16/BF16 压缩到 FP8 或 INT8，以减少显存占用和访存带宽。之所以越来越重要，是因为长上下文场景下 KV Cache 已经成为显存的绝对大头——一个 7B 模型 128K 上下文的 KV Cache 可能占到几十 GB。和权重量化不同，KV 量化的挑战在于每层 K/V 的数值分布不一样，需要 per-channel 或 per-token 的 scale 策略。面试中可以补一句：权重量化省的是模型参数显存，KV 量化省的是上下文显存，两者可以叠加。
+
+### 高频问题 9：长上下文推理（128K+）面临的主要挑战是什么？
+
+**答：**
+
+主要有三个方面：
+
+1. **KV Cache 显存爆炸**：上下文越长，缓存的 K/V 越多，显存占用线性增长，很快超出单卡容量
+2. **Attention 计算量二次增长**：标准 attention 的计算量是 O(n²d)，128K 上下文的 prefill 计算量远超短上下文
+3. **位置编码外推**：RoPE 等位置编码在训练长度之外的外推能力有限，需要 NTK-aware scaling、YaRN 等技术
+
+解决方案包括：FlashAttention（减少 HBM 访问）、Ring Attention / Sequence Parallelism（跨卡切分序列维度）、KV Cache 量化/压缩（减少存储）。面试里点出"显存、计算、编码"三个维度就够了。
+
+### 高频问题 10：推理中的 Tensor Parallelism 和 Pipeline Parallelism 怎么选？
+
+**答：**
+
+当模型太大一张卡放不下时，推理也需要并行：
+
+- **TP（张量并行）**：把同一层的权重切到多卡上，每步需要 AllReduce 通信，但延迟增加较少。适合放在 **机内 NVLink 互连** 的卡之间，因为通信量大但延迟要求高。
+- **PP（流水并行）**：把不同层放到不同卡上，按流水线执行。通信量更小（只传激活），但会引入 pipeline bubble。
+
+推理中通常优先用 TP，因为推理 batch 小、延迟敏感，PP 的 bubble 开销占比更大。经验法则：机内用 TP，跨机用 PP，能用 DP（模型副本）尽量先用 DP。
+
+### 高频问题 11：FlashAttention 的核心原理是什么？为什么能同时省显存和提速？
+
+**答：**
+
+FlashAttention 的核心是 **tiling + online softmax**：
+
+1. 把 Q/K/V 分成小块（tile），每次只加载一块到 SRAM 中计算
+2. 用 online softmax 算法（基于 Milakov-Gimelshein 技巧）在分块过程中逐步更新 softmax 的分母，避免需要先算完全部 QK^T 再做 softmax
+3. 中间的 N×N attention 矩阵不需要写回 HBM，只在 SRAM 里暂存
+
+省显存是因为不需要 materialze O(N²) 的 attention 矩阵；提速是因为大幅减少了 HBM 读写次数。标准 attention 的 HBM 访问量是 O(N²d)，FlashAttention 降到 O(N²d²/M)（M 是 SRAM 大小）。
+
+### 高频问题 12：RoPE 为什么适合推理中的 KV Cache？
+
+**答：**
+
+RoPE（Rotary Position Embedding）的关键性质是：位置信息被编码到 Q 和 K 中，而不是加在输入上。这意味着 KV Cache 中存的 K 已经包含了位置信息，decode 时新 token 的 Q 也自然带有自己的位置信息，两者做点积时自动产生相对位置的效果。这比绝对位置编码更适合 KV Cache 复用和 prefix caching，因为相同前缀的 KV 不会因为绝对位置不同而需要重新计算。
+
+### 高频问题 13：`DeepSeek-V3` 这类题如果让你现场写伪代码和手算，最稳的回答框架是什么？
+
+**答：**
+
+最稳的方式不是背某个固定数字，而是按模块拆：
+
+`Embedding -> [Attention / MLA -> MoE / FFN -> Residual / Norm] x L -> LM Head`
+
+然后分别估：
+
+- 主干 dense 部分的参数和权重读取
+- `MLA` 对 KV 缓存与带宽的压缩
+- `MoE` 的总 expert 参数量、单 token 激活 expert 参数量
+- 多卡场景下 token 分发带来的通信代价
+
+这样即使你不背具体公开配置，也能把题讲得结构清楚、逻辑正确。
+
+### 高频问题 14：LLaMA 1 → 2 → 3 的架构演变
+
+**答：**
+
+| 维度 | LLaMA 1 (2023.02) | LLaMA 2 (2023.07) | LLaMA 3/3.1 (2024) |
+|------|-------------------|-------------------|---------------------|
+| 模型大小 | 7B, 13B, 33B, 65B | 7B, 13B, **70B** | **8B**, **70B**, **405B** |
+| 上下文长度 | 2K | **4K** | **8K**（3.1: **128K**） |
+| Attention | MHA | **GQA**（70B: 8 KV head） | GQA（全系列） |
+| Tokenizer | SentencePiece, 32K vocab | SentencePiece, 32K vocab | **tiktoken, 128K vocab** |
+| 训练数据 | 1.4T tokens | **2T tokens** | **15T+ tokens** |
+| 其他 | RoPE + RMSNorm + SwiGLU | 增加 RLHF（Chat） | RoPE scaling 做 128K |
+
+**关键演变总结：**
+- LLaMA 1→2：GQA 减少 KV Cache，更多训练数据，RLHF 对齐
+- LLaMA 2→3：128K 词表提升多语言和 token 效率，数据量暴增到 15T+，架构本身非常稳定
+- 整体趋势是**架构不变、scaling up + 更多数据**
+
+### 高频问题 15：Qwen3 的 MoE 怎么做的？
+
+**答：**
+
+Qwen3-MoE 采用 **Fine-grained Expert（细粒度专家）** 设计：
+
+```
+传统 MoE (Mixtral): 8 个大 expert，每 token 激活 top-2
+Qwen3-MoE:         128 个小 expert，每 token 激活 top-8 + 1 个 shared expert（必经）
+```
+
+| 特性 | 内容 |
+|------|------|
+| Expert 数量 | 128 个小 expert（vs 传统 8/16 个大 expert） |
+| 激活 expert 数 | 每 token 激活 8 个 |
+| Shared Expert | 有（所有 token 必经的共享专家，保证基础能力不退化） |
+| Router | Top-K routing with load balancing loss |
+
+**为什么 fine-grained？** 更多 expert → routing 粒度更细 → 每个 token 获得更专业化处理；激活更多小 expert → 组合灵活性更高。
+
+### 高频问题 16：DeepSeek 的 MTP（Multi-Token Prediction）是什么？
+
+**答：**
+
+传统 LLM 每步只预测下一个 token。MTP 在训练时同时预测未来多个 token。
+
+```
+传统:    hidden_state → LM Head → predict token t+1
+DeepSeek MTP:
+         hidden_state → LM Head 0  → predict t+1
+                      → MTP Head 1 → predict t+2
+                      → MTP Head 2 → predict t+3
+```
+
+每个 MTP module 包含：Embedding 投影 + 一层 Transformer Block + 共享 LM Head，接收上一步预测 embedding 和 main model 的 hidden state。
+
+**MTP 的三重作用：**
+1. **训练信号更丰富**：每个位置提供多个梯度信号，提高数据效率
+2. **推理加速**：训练好的 MTP head 天然可做 speculative decoding 的 draft
+3. **更好的表征学习**：迫使模型学习更远的依赖关系
+
+**与 Medusa 的区别：** MTP 在**预训练阶段**就参与训练，head 质量更高、acceptance rate 更好；Medusa 是在已训练好的模型上**后期加装** head。
+
+---
+
+## 模块 10：推理核心技术补充面试题
+
+### KV Cache 原理
+
+**答：**
+
+自回归解码中，每生成一个新 token 都需要与所有历史 token 做 Attention。
+
+```
+无 KV Cache（每步重算所有 K/V）：
+Step 1: 计算 Q1, K1, V1 → Attn(Q1, [K1], [V1])
+Step 2: 计算 Q2, K2, V2, 重算 K1, V1 → Attn(Q2, [K1,K2], [V1,V2])
+Step 3: 计算 Q3, K3, V3, 重算 K1,K2, V1,V2 → ...
+总计算: O(n²) 的 KV 投影
+
+有 KV Cache（缓存历史 K/V）：
+Step 1: 计算 K1, V1 → 缓存 → Attn
+Step 2: 只算 K2, V2 → 追加缓存 → Attn(Q2, [K1,K2], [V1,V2])
+Step 3: 只算 K3, V3 → 追加缓存 → Attn(Q3, [K1,K2,K3], ...)
+总计算: O(n) 的 KV 投影
+```
+
+**KV Cache 大小公式：**
+```
+KV Cache (bytes) = 2 × num_layers × num_kv_heads × head_dim × seq_len × batch_size × bytes_per_param
+
+示例（7B LLaMA, FP16, batch=1, seq=4096）：
+= 2 × 32 × 32 × 128 × 4096 × 1 × 2 ≈ 2 GB
+```
+
+**核心 Trade-off：用显存换计算。** 显存占用随序列长度线性增长，但避免了 O(n²) 的重复计算。
+
+### R1 的 MLA 是如何实现 KV-Cache 节约的
+
+**答：**
+
+**MLA（Multi-head Latent Attention）** 是 DeepSeek-V2/R1 的核心创新，通过低秩压缩 KV 来减少缓存。
+
+```
+标准 MHA 的 KV Cache（每 token 每层）：
+cache = [K, V] = 2 × n_heads × d_head
+       例：2 × 128 × 128 = 32768 维
+
+MLA 的 KV Cache（每 token 每层）：
+Step 1: 下投影（压缩）
+  c_t = W_DKV · h_t        ← h_t ∈ R^d → c_t ∈ R^{d_c}, d_c << n_h × d_h
+  只缓存 c_t（+ RoPE 分量 k_rope）
+
+Step 2: 上投影（计算时恢复）
+  K = W_UK · c_t            ← 从低维恢复 K
+  V = W_UV · c_t            ← 从低维恢复 V
+
+Cache = c_t + k_rope ≈ d_c + d_rope 维
+       例：512 + 64 = 576 维
+```
+
+**节省效果：**
+```
+MHA:  32768 维/token/层 (2 × 128 × 128)
+GQA:  2048 维/token/层  (2 × 8 × 128, 8 个 KV head)
+MLA:  576 维/token/层   (512 + 64)
+
+MLA vs MHA: 减少 ~98%
+MLA vs GQA: 减少 ~72%
+```
+
+**为什么要单独缓存 RoPE 分量：** RoPE 与位置相关，无法被低秩压缩吸收（因为旋转矩阵依赖绝对位置），所以需要单独存储位置编码相关的 key 分量。
+
+### 讲讲推理中的 KV Cache 和 Paged Attention
+
+**答：**
+
+**KV Cache 的问题：** 传统实现预分配连续内存，但实际序列长度不确定。
+
+```
+预分配方式（浪费严重）：
+请求1 [████░░░░░░░░░░░░] 实际 512，分配 2048 → 浪费 75%
+请求2 [████████████░░░░] 实际 1536，分配 2048 → 浪费 25%
+平均显存利用率只有 ~30-50%
+```
+
+**PagedAttention（vLLM）：** 借鉴操作系统虚拟内存分页机制。
+
+```
+KV Cache 分成固定大小的 Block（如 16 tokens/block）：
+
+逻辑视图（连续）：  [Block0][Block1][Block2][Block3]
+物理视图（不连续）：  [Block0][_][Block2][_][Block1][Block3]
+                              ↑ 其他请求     ↑ 其他请求
+
+Page Table 维护映射：
+请求1: 逻辑Block0 → 物理Block3, 逻辑Block1 → 物理Block7, ...
+请求2: 逻辑Block0 → 物理Block1, ...
+```
+
+**PagedAttention 的关键优势：**
+1. **近零浪费**：按需分配 Block，不预分配
+2. **Copy-on-Write**：Beam Search 中多个 beam 共享前缀 KV，分叉时才复制
+3. **动态增长**：序列变长时追加新 Block，不需要重新分配
+4. **吞吐提升 2-4x**：更高显存利用率 → 更多并发请求
+
+### 介绍下 Softmax、Safe-Softmax、Online-Softmax、Flash Attention
+
+**答：**
+
+**演化链路：** Softmax → Safe-Softmax → Online-Softmax → Flash Attention
+
+**1. Softmax：**
+```
+softmax(x_i) = exp(x_i) / Σ_j exp(x_j)
+问题：exp(x_i) 可能溢出（x_i > 88 时 FP32 就溢出）
+需要 3 次遍历：计算 exp → 求和 → 归一化
+```
+
+**2. Safe-Softmax：**
+```
+m = max(x)  ← 第 1 遍：找最大值
+softmax(x_i) = exp(x_i - m) / Σ_j exp(x_j - m)
+减去最大值防止溢出，数学等价
+需要 3 次遍历：找 max → 计算 exp 和 sum → 归一化
+```
+
+**3. Online-Softmax：**
+```
+在一次遍历中同时更新 max 和 sum：
+for each x_i:
+    if x_i > m:
+        sum = sum × exp(m - x_i) + 1  ← 修正历史 sum
+        m = x_i
+    else:
+        sum = sum + exp(x_i - m)
+减少为 2 次遍历：（1 遍更新 max+sum，1 遍归一化）
+```
+
+**4. Flash Attention：**
+```
+将 Online-Softmax 推广到分块 Attention 计算：
+- 将 Q/K/V 分成 tiles
+- 每个 tile 内用 Online-Softmax 计算部分 attention
+- tile 间通过在线更新修正 softmax 统计量
+- 最终结果数学精确（exact attention）
+
+核心：不需要 N×N attention 矩阵，只需 tile 大小的 SRAM 空间
+```
+
+### Flash Attention 加速原理，FA2 相比 FA1 改进
+
+**答：**
+
+**FA1 核心原理：**
+- **Tiling**：Q/K/V 分块加载到 SRAM（~20MB），避免 N×N 矩阵写入 HBM
+- **Online-Softmax**：分块计算中维护 running max 和 running sum
+- **重计算**：反向传播时从 Q/K/V 重算 attention（不存中间矩阵）
+- **IO 复杂度**：从 O(N²) HBM 访问降到 O(N²d/M)
+
+**FA2 改进（~2x speedup over FA1）：**
+
+| 改进点 | FA1 | FA2 |
+|--------|-----|-----|
+| **外层循环** | 遍历 K/V blocks | **遍历 Q blocks** → 每个 Q block 的结果在 SRAM 完成后一次写出 |
+| **非 matmul FLOPs** | rescaling 在每个 inner loop | **延迟到最后统一 rescaling** → 减少非矩阵乘操作 |
+| **并行维度** | batch × heads | batch × heads × **Q blocks** → 更多并行度 |
+| **Warp 间分工** | split K/V across warps | **split Q across warps** → 减少 warp 间共享内存通信 |
+| **最大 head_dim** | 128 | **256** |
+
+### FA3 相比 FA2 改进
+
+**答：**
+
+FA3 专为 **Hopper 架构（H100）** 设计，充分利用新硬件特性：
+
+| 改进点 | FA2 | FA3 |
+|--------|-----|-----|
+| **数据搬运** | Thread 手动 load | **TMA 异步搬运**（硬件自动） |
+| **执行模型** | 所有 warp 做相同工作 | **Warp Specialization**（生产者-消费者模式） |
+| **调度策略** | 单缓冲 | **Ping-pong 双缓冲调度** |
+| **低精度支持** | FP16/BF16 | 新增 **FP8** |
+| **FP8 精度保持** | - | **Incoherent Processing**（随机正交变换） |
+| **硬件指令** | HMMA | **WGMMA**（更高效的矩阵乘指令） |
+| **相对速度** | 1x | **1.5-2x** |
+
+**Warp Specialization 详解：**
+```
+FA2: 所有 warp → load data → compute → load data → compute（串行）
+
+FA3: Producer warps: → load tile_0 → load tile_1 → load tile_2 →
+     Consumer warps:           → compute_0 → compute_1 → compute_2 →
+     完全流水线化，load 和 compute 完全重叠
+```
+
+### TP=2 时，self-attention 层里的 QKV 矩阵怎么切分
+
+**答：**
+
+**Tensor Parallelism 对 Attention 的切分方式：按 head 切分。**
+
+```
+假设模型有 32 个 attention heads，TP=2：
+
+GPU 0: heads 0-15  (16 heads)
+GPU 1: heads 16-31 (16 heads)
+
+具体切分：
+W_Q ∈ R^{d × d}  → column-split → GPU0: W_Q[:, :d/2], GPU1: W_Q[:, d/2:]
+W_K ∈ R^{d × d}  → column-split → GPU0: W_K[:, :d/2], GPU1: W_K[:, d/2:]
+W_V ∈ R^{d × d}  → column-split → GPU0: W_V[:, :d/2], GPU1: W_V[:, d/2:]
+W_O ∈ R^{d × d}  → row-split    → GPU0: W_O[:d/2, :], GPU1: W_O[d/2:, :]
+```
+
+**计算流程：**
+```
+Step 1: 各 GPU 计算本地 heads 的 QKV（无通信）
+  GPU0: Q0 = X · W_Q0, K0 = X · W_K0, V0 = X · W_V0
+  GPU1: Q1 = X · W_Q1, K1 = X · W_K1, V1 = X · W_V1
+
+Step 2: 各 GPU 独立计算本地 attention（无通信）
+  GPU0: O0 = Attention(Q0, K0, V0) · W_O0
+  GPU1: O1 = Attention(Q1, K1, V1) · W_O1
+
+Step 3: AllReduce 聚合输出（需要通信）
+  Output = O0 + O1  ← AllReduce
+```
+
+**关键点：**
+- QKV 投影是 Column Parallel（按 head 切），无通信
+- Output 投影是 Row Parallel，需要 AllReduce
+- **每个 Attention 层只需 1 次 AllReduce 通信**
+
+---
+
+## 模块 11：模型架构面试题
+
+### Qwen 系列模型的结构和特点
+
+**答：**
+
+| 版本 | 参数量 | 架构特点 | 关键技术 |
+|------|--------|---------|---------|
+| **Qwen** | 7B/14B | Decoder-only | RoPE, SwiGLU, RMSNorm |
+| **Qwen1.5** | 0.5B~72B | 同上 + GQA | 扩展模型系列 |
+| **Qwen2** | 0.5B~72B | GQA + Sliding Window | 部分层用滑动窗口注意力 |
+| **Qwen2.5** | 0.5B~72B | 同 Qwen2 | 更多训练数据，更强代码/数学 |
+| **Qwen3** | Dense + MoE | 新增 MoE 版本 + Thinking Mode | 128 experts, Top-8, shared experts |
+
+**Qwen 系列共性特征：**
+- 位置编码：RoPE（+ YaRN 扩展长上下文）
+- 激活函数：SwiGLU
+- 归一化：RMSNorm（Pre-Norm）
+- 注意力：GQA（Qwen2+）
+- 词表：大词表（151K+），多语言友好
+
+### DeepSeek 系列模型的结构和特点
+
+**答：**
+
+| 版本 | 总参数/激活 | 核心创新 |
+|------|-----------|---------|
+| **V1** | 67B Dense | 标准 Decoder-only |
+| **V2** | 236B/21B | **MLA** + 细粒度 MoE（160 experts） |
+| **V3** | 671B/37B | 无辅助 loss 均衡 + **FP8 训练** + MTP |
+| **R1** | 基于 V3 | **GRPO RL 训练** + 长链推理 |
+
+**关键创新详解：**
+
+1. **MLA（Multi-head Latent Attention）**：KV 低秩压缩，缓存减少 93%+
+2. **细粒度 MoE**：256 个小 expert + 共享 expert
+3. **FP8 训练**：V3 全程 FP8 混合精度，训练效率翻倍
+4. **MTP（Multi-Token Prediction）**：训练时预测多个未来 token
+5. **GRPO（R1）**：无 Critic 的 RL，组内相对奖励
+
+### Qwen3 相比 Qwen2.5 有哪些改进
+
+**答：**
+
+| 维度 | Qwen2.5 | Qwen3 |
+|------|---------|-------|
+| **架构** | Dense only | Dense + **MoE 版本** |
+| **推理模式** | 标准生成 | 新增 **Thinking Mode**（显示推理过程） |
+| **MoE 配置** | 无 | 128 routed + shared experts, Top-8 |
+| **上下文** | 128K | 128K+（改进 YaRN） |
+| **多语言** | 强 | 更强（更多语种覆盖） |
+| **代码/数学** | 强 | 显著提升 |
+| **基础架构** | RoPE + SwiGLU + RMSNorm + GQA | 同上（保持稳定） |
+
+**Thinking Mode：** Qwen3 可以在生成最终回答前，先输出内部推理过程（类似 DeepSeek-R1 的 chain-of-thought），用户可选是否显示。
+
+### DeepSeek 在哪些方面做了改进使其训练成本显著降低
+
+**答：**
+
+DeepSeek-V3 训练成本仅约 **$5.5M**（vs 同等模型数百万美元），关键优化：
+
+| 优化点 | 节省来源 | 效果 |
+|--------|---------|------|
+| **MLA** | KV Cache 减少 → 支持更长上下文/更大 batch | 推理效率 ↑ |
+| **细粒度 MoE** | 671B 参数但只激活 37B | 计算量只有同等 Dense 的 ~5% |
+| **FP8 训练** | 2x 计算吞吐（vs BF16） | 训练时间减半 |
+| **无辅助 loss 均衡** | 更好的 expert 利用率 | 训练效率 ↑ |
+| **MTP（Multi-Token Prediction）** | 更丰富的训练信号 | 数据效率 ↑ |
+| **高效工程** | 通信优化、流水线设计 | 硬件利用率 ↑ |
+
+**关键洞察：** DeepSeek 证明了"架构创新 > 堆算力"。通过 MLA 节省显存、MoE 节省计算、FP8 提升吞吐，实现了用 2048 张 H800（而非万卡集群）训练顶级模型。
+
+---
+
+## 模块 12：推理系统深度面试题
+
+### Roofline Model：怎么判断 Kernel 是 Compute-bound 还是 Memory-bound
+
+**答：**
+
+GPU 有两个硬件上限：**算力上限**（A100: 312 TFLOPS FP16）和**带宽上限**（A100: 2 TB/s）。
+
+**算力带宽比 = 312T / 2T = 156 FLOPs/Byte**
+
+对任何 kernel，算出 **Arithmetic Intensity = FLOPs / Bytes**：
+
+```
+如果 AI < 156 → 数据搬运还没完，算力就闲着了 → Memory-bound
+如果 AI > 156 → 数据已搬来但算不完 → Compute-bound
+拐点 = 硬件算力带宽比
+```
+
+**Decode Linear（矩阵×向量）：**
+```
+权重 [4096, 4096]，输入 [1, 4096]
+FLOPs = 2 × 4096 × 4096 = 33M
+Bytes = 4096 × 4096 × 2 = 33MB（读权重）
+AI = 33M / 33MB ≈ 1 FLOPs/Byte → 远小于 156 → Memory-bound
+```
+
+**Prefill Linear（矩阵×矩阵）：**
+```
+权重 [4096, 4096]，输入 [512, 4096]
+FLOPs = 2 × 512 × 4096 × 4096 = 17G
+Bytes = 33MB（权重只读一次）
+AI = 17G / 33MB ≈ 512 FLOPs/Byte → 远大于 156 → Compute-bound
+```
+
+**本质区别：** 权重读取量相同，但 prefill 有 512 个 token 复用这份权重，AI 从 1 飙到 512。
+
+### Continuous Batching vs Dynamic Batching 的区别
+
+**答：**
+
+| 维度 | Dynamic Batching | Continuous Batching |
+|------|-----------------|-------------------|
+| **调度粒度** | 请求级别 | **Token 级别** |
+| **执行方式** | 攒一波一起跑，跑完再攒下一波 | 随到随进，完了就走，永远不停 |
+| **中途变更** | ❌ batch 执行中不能改 | ✅ 每步可插入/移除请求 |
+| **GPU 利用率** | 低（短请求等长请求） | **高（空位立刻填补）** |
+
+**具体数字说明：**
+```
+4 个请求，生成长度分别是 20、50、100、200 tokens
+
+Static/Dynamic Batching：
+  整个 batch 等最长的 200 步完成
+  GPU 有效利用率 = (20+50+100+200) / (200×4) = 46%
+
+Continuous Batching：
+  第 20 步：请求 1 完成 → 立刻填入新请求
+  第 50 步：请求 2 完成 → 立刻填入新请求
+  GPU 始终满载
+```
+
+### CUDA Graph 详解：为什么 Decode 能用、Prefill 不能
+
+**答：**
+
+CUDA Graph 把一系列 kernel 调用录制成"执行图"，replay 时一次性发射，省掉逐个 launch 的 CPU 开销。
+
+**Prefill 不能用的原因：** shape 不固定。每个请求 prompt 长度不同，tensor shape 每次都变。CUDA Graph 录制后所有 shape 锁死，无法适应。
+
+**Decode 能用的原因：** 输入 shape 只取决于 batch size（每序列固定 1 token），可以预枚举 bs=1,2,4,8,16... 提前录好。
+
+**从大到小录制的原因：** 大 bs 的 graph 先分配最大显存池，小 bs 的 graph 复用这个池，不需要额外分配。反过来从小到大录会导致显存碎片。
+
+**runtime 选择：** 实际 bs=5 → 选 bs=8 的 graph，3 个位置 padding，slot_mapping=-1 让 kernel 跳过不写 KV cache。
+
+**其他限制：**
+- 不支持动态控制流（if/else 依赖运行时数据）
+- 不支持 CPU-GPU 同步（`.item()` / `.cpu()`）
+- 显存地址固定，不能创建新 tensor
+- MoE 激活 expert 数量不固定时不能用
+
+### Prefix Caching 详细机制
+
+**答：**
+
+**核心：** 跨请求复用 KV cache 的相同前缀，跳过重复 prefill。
+
+**工作机制：**
+```
+1. 每个 KV block 用 xxhash 算指纹：
+   hash = xxhash(上一个 block 的 hash + 当前 block 的 token ids)
+   → 链式依赖，保证前缀匹配
+
+2. 新请求进来，逐 block 算 hash 查表：
+   命中 → 复用物理 block（ref_count++），跳过 prefill
+   未命中 → 分配新 block，正常 prefill
+
+3. 请求结束后 block 进入 CACHED 中间态：
+   hash 映射保留，物理 block 回到 free pool
+   → 新请求命中 → 复用
+   → 显存紧张 → 被覆盖淘汰（LRU）
+```
+
+**收益最大场景：** 大量请求共享 system prompt（如客服机器人 2000 token prompt，第 2-N 个请求直接复用）、多轮对话、few-shot 共享 examples。
+
+### KV Cache 量化
+
+**答：**
+
+把 KV cache 从 FP16（2 bytes）量化到 INT8/FP8（1 byte），显存减半。
+
+**跟权重量化的区别：**
+
+| 维度 | 权重量化 | KV Cache 量化 |
+|------|---------|--------------|
+| **时机** | 离线（部署前做好） | **在线（每步实时量化/反量化）** |
+| **数据特性** | 静态，固定不变 | 动态，每个请求不同 |
+| **挑战** | 校准数据选取 | 量化/反量化 kernel 速度要求高 |
+| **省什么** | 模型参数显存 | 上下文显存 |
+
+**对长序列特别重要：** KV cache ∝ seq_len，128K 上下文可能单个请求 KV cache 就超过模型权重大小。量化后同等显存服务两倍长度或两倍并发。
+
+**额外速度收益：** Decode attention 是 memory-bound，KV 数据量减半 → HBM 读取量减半 → decode 速度提升。
+
+### PD 分离（Prefill-Decode Disaggregation）
+
+**答：**
+
+**核心思想：** 把 Prefill 和 Decode 放到**不同 GPU 集群**上执行。
+
+```
+Prefill 集群（compute-optimized）：
+  → 只处理新请求的 prompt
+  → 算完 prefill 后把 KV cache 传给 decode 集群
+
+Decode 集群（bandwidth-optimized）：
+  → 只做逐 token 生成
+  → 接收 KV cache 后开始 decode 循环
+```
+
+**为什么要分离：** Prefill 是 compute-bound，decode 是 memory-bound，两者对硬件需求完全不同。混在一起要么 prefill 卡住 decode（用户感到卡顿），要么 decode 阶段算力浪费。
+
+**工程挑战：** KV cache 跨集群传输（一个 2048 长度请求约 256MB），需要高带宽网络和异步传输机制。
+
+### Speculative Decoding 的接受率数学
+
+**答：**
+
+**验证是顺序的，遇到第一个错就停。**
+
+假设 draft model 准确率 p=50%，猜 K=4 个 token：
+
+```
+第 1 个就错：概率 0.5      → 获得 1 个 token（target 纠正）
+对 1 错 2：  概率 0.25     → 获得 2 个 token
+对 2 错 3：  概率 0.125    → 获得 3 个 token
+对 3 错 4：  概率 0.0625   → 获得 4 个 token
+全对：       概率 0.0625   → 获得 5 个 token（4 个 draft + target 白送 1 个）
+
+期望 = 0.5×1 + 0.25×2 + 0.125×3 + 0.0625×4 + 0.0625×5 = 1.94 个 token
+```
+
+**加速比估算：** 不做 speculative decoding 每次前向产 1 token，现在产 1.94 token，验证成本约 1.1 次前向（4 token 并行验证 + draft 开销约 10%），加速比 ≈ 1.94/1.1 ≈ **1.76×**。
+
+**一般准确率要 70%+ 才有明显收益。**
+
+### Transformer 单层计算流程（带具体 Shape）
+
+**答：**
+
+以 Llama 3 8B 为例（d=4096, h_q=32, h_kv=8, d_h=128, d_ff=11008, L=32）：
+
+```
+输入 x: [1, seq_len, 4096]
+
+① RMSNorm(x) → [1, seq_len, 4096]              // 逐 token 归一化
+
+② QKV Linear:
+   Q = x @ W_q[4096, 4096] → [1, seq, 32, 128]  // 32 个 Q head
+   K = x @ W_k[4096, 1024] → [1, seq, 8, 128]   // 8 个 KV head (GQA)
+   V = x @ W_v[4096, 1024] → [1, seq, 8, 128]
+
+③ RoPE(Q, K)                                     // 只作用于 Q 和 K
+
+④ Attention:
+   scores = Q·Kᵀ/√128 → [1, 32, seq, seq]       // 每 4 个 Q head 共享 1 个 K head
+   causal mask → softmax → ×V → [1, 32, seq, 128]
+
+⑤ O Linear: concat → [1, seq, 4096] @ W_o[4096, 4096] → [1, seq, 4096]
+
+⑥ 第一次残差: x' = O_output + x → [1, seq, 4096]
+
+⑦ RMSNorm(x') → [1, seq, 4096]
+
+⑧ FFN (SwiGLU):
+   gate = x' @ W_gate[4096, 11008] → [1, seq, 11008]  // 升维
+   up   = x' @ W_up[4096, 11008]   → [1, seq, 11008]
+   mid  = SiLU(gate) × up          → [1, seq, 11008]  // 门控
+   down = mid @ W_down[11008, 4096] → [1, seq, 4096]   // 降维
+
+⑨ 第二次残差: output = down + x' → [1, seq, 4096]
+```
+
+**重复 32 层后：** → RMSNorm → LM Head [4096, 128256] → logits → sampling → token ID
+
+**关键记忆点：** 两次 RMSNorm（attention 前 + FFN 前），两次残差（attention 后 + FFN 后），Pre-Norm 架构。
+
+### 推理优化的系统化排查思路
+
+**答：**
+
+面试标准框架（适用于所有"你怎么优化 XX 系统"的问题）：
+
+```
+第一步：Nsight Systems 抓全局 timeline（不猜瓶颈）
+  → Prefill 和 decode 各占多少时间？
+  → Kernel 之间有没有 gap？
+  → NCCL 通信占比？
+
+第二步：定位瓶颈类型
+  → TTFT 高 → Prefill 问题（prefix caching？chunked prefill？）
+  → Per-token latency 高 → Decode 问题（CUDA Graph？KV 量化？）
+  → 吞吐低 → 调度/显存问题（PagedAttention？scheduler 策略？）
+
+第三步：针对性优化
+  → Kernel gap → CUDA Graph / 算子融合
+  → 小算子碎片化 → torch.compile / 手写融合 kernel
+  → 通信占比高 → overlap / 调整 TP/PP/EP
+  → KV cache 大 → 量化 / GQA / MLA
+
+第四步：Nsight Compute 深挖热点 kernel
+  → occupancy、memory throughput、warp stall
+```
+
+**核心原则：profiling 驱动，不凭感觉。**
+
+---
+
+## 推荐使用方式
+
+如果你要准备推理面试，可以按这个顺序读：
+
+1. 先读 `模块 3 + 模块 4 + 模块 6`，建立 prefill / attention / decode 主链路
+2. 再读 `模块 2 + 模块 7`，理解调度和高级加速
+3. 如果面试偏系统，补 `模块 5 + 模块 9`
+4. 如果面试偏产品或应用，重点看 `模块 8`
+5. 补充阅读 `模块 10` 的核心技术题和 `模块 11` 的模型架构题
+6. 深度准备看 `模块 12` 的系统面试题（Roofline、CUDA Graph、PD 分离等）
+
+---
+
+## 对照到旧文档
+
+- 如果想背诵 30 秒答案，看 [QuickInterviewAnswers.md](/docs/quick-ref/quick-answers)
+- 如果想看推理优化速记，看 [InferenceOptimization.md](/docs/inference/optimization)
+- 如果想看更资深的追问，看 [SeniorInterviewQuestions.md](/docs/advanced/senior)
